@@ -5,7 +5,7 @@ module ClassReader where
 import Control.Monad (replicateM)
 import Control.Monad.Except (ExceptT, MonadError (throwError), liftEither, runExceptT)
 import Control.Monad.Trans (lift)
-import Data.Binary (Get, Word16, Word32, Word8)
+import Data.Binary (Get, Word16, Word32, Word64, Word8)
 import Data.Binary.Get (runGet)
 import Data.Binary.Get qualified as BG
 import Data.ByteString (unpack)
@@ -36,9 +36,9 @@ data PoolEntry
   = InvalidEntry
   | Utf8Info String
   | IntegerInfo Word32
-  | FloatInfo Word32
-  | LongInfo Word32 Word32
-  | DoubleInfo Word32 Word32
+  | FloatInfo Float
+  | LongInfo Word64
+  | DoubleInfo Double
   | ClassInfo Word16
   | StringInfo Word16
   | FieldRefInfo Word16 Word16
@@ -91,6 +91,9 @@ getU2 = lift BG.getWord16be
 getU4 :: ReadResult Word32
 getU4 = lift BG.getWord32be
 
+getU8 :: ReadResult Word64
+getU8 = lift BG.getWord64be
+
 runClassReader :: BS.ByteString -> Either ClassReadError ClassFile
 runClassReader = (runGet . runExceptT) readClassFile
 
@@ -124,26 +127,28 @@ readClassHeader magic = throwError $ InvalidMagic magic
 
 readConstantPool :: Word16 -> ReadResult [PoolEntry]
 readConstantPool 0 = pure []
-readConstantPool n =
-  (++) <$> (resolveEntry <$> (readPoolEntry =<< getU1)) <*> readConstantPool (n - 1)
+readConstantPool n = do
+  (padded, wide) <- resolveEntry <$> (readPoolEntry =<< getU1)
+  ((++) padded) <$> readConstantPool (if wide then n - 2 else n - 1)
   where
-    resolveEntry :: PoolEntry -> [PoolEntry]
-    resolveEntry e@LongInfo {} = [e, InvalidEntry]
-    resolveEntry e@DoubleInfo {} = [e, InvalidEntry]
-    resolveEntry e = [e]
+    resolveEntry :: PoolEntry -> ([PoolEntry], Bool)
+    resolveEntry e@LongInfo {} = ([e, InvalidEntry], True)
+    resolveEntry e@DoubleInfo {} = ([e, InvalidEntry], True)
+    resolveEntry e = ([e], False)
     readPoolEntry :: Word8 -> ReadResult PoolEntry
-    readPoolEntry 1 = Utf8Info . T.unpack . TE.decodeUtf8 <$> (lift . BG.getByteString . fromIntegral =<< getU2)
-    readPoolEntry 3 = IntegerInfo <$> getU4
-    readPoolEntry 4 = FloatInfo <$> getU4
-    readPoolEntry 5 = LongInfo <$> getU4 <*> getU4
-    readPoolEntry 6 = DoubleInfo <$> getU4 <*> getU4
-    readPoolEntry 7 = ClassInfo <$> getU2
-    readPoolEntry 8 = StringInfo <$> getU2
-    readPoolEntry 9 = FieldRefInfo <$> getU2 <*> getU2
-    readPoolEntry 10 = MethodRefInfo <$> getU2 <*> getU2
-    readPoolEntry 11 = InterfaceMethodInfo <$> getU2 <*> getU2
-    readPoolEntry 12 = NameAndTypeInfo <$> getU2 <*> getU2
-    readPoolEntry tag = throwError $ InvalidPoolEntryTag tag
+    readPoolEntry = \case
+      1 -> Utf8Info . T.unpack . TE.decodeUtf8 <$> (lift . BG.getByteString . fromIntegral =<< getU2)
+      3 -> IntegerInfo <$> getU4
+      4 -> FloatInfo . fromIntegral <$> getU4
+      5 -> LongInfo . fromIntegral <$> getU8
+      6 -> DoubleInfo . fromIntegral <$> getU8
+      7 -> ClassInfo <$> getU2
+      8 -> StringInfo <$> getU2
+      9 -> FieldRefInfo <$> getU2 <*> getU2
+      10 -> MethodRefInfo <$> getU2 <*> getU2
+      11 -> InterfaceMethodInfo <$> getU2 <*> getU2
+      12 -> NameAndTypeInfo <$> getU2 <*> getU2
+      tag -> throwError $ InvalidPoolEntryTag tag
 
 readInterfaces :: ConstantPool -> Word16 -> ReadResult [String]
 readInterfaces pool n = replicateM (fromIntegral n) (getClassInfo pool =<< getU2)
@@ -195,58 +200,59 @@ readAttributeInfo pool = do
   liftEither attributeInfo
   where
     matchAttribute :: String -> ReadResult AttributeInfo
-    matchAttribute "ConstantValue" = AttributeInfoConstantValue <$> getU2
-    matchAttribute "Code" = uncurry5 AttributeInfoCode <$> readCode
-      where
-        readCode :: ReadResult (Word16, Word16, [Word8], [(Word16, Word16, Word16, Word16)], [AttributeInfo])
-        readCode = do
-          maxStack <- getU2
-          maxLocals <- getU2
-          codeLen <- fromIntegral <$> getU4
-          code <- unpack <$> (lift . BG.getByteString $ codeLen)
-          exnTable <- readExnTable =<< getU2
-          attributes <- readAttributes pool =<< getU2
-          pure (maxStack, maxLocals, code, exnTable, attributes)
-        readExnTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16)]
-        readExnTable n = replicateM (fromIntegral n) exn
-        exn :: ReadResult (Word16, Word16, Word16, Word16)
-        exn = (,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2
-        uncurry5 f (a, b, c, d, e) = f a b c d e
-    matchAttribute "StackMapTable" = undefined
-    matchAttribute "Exceptions" = AttributeInfoExceptions <$> (readExceptions =<< getU2)
-      where
-        readExceptions :: Word16 -> ReadResult [Word16]
-        readExceptions n = replicateM (fromIntegral n) getU2
-    matchAttribute "InnerClasses" = undefined
-    matchAttribute "EnclosingMethod" = undefined
-    matchAttribute "Synthetic" = undefined
-    matchAttribute "Signature" = undefined
-    matchAttribute "SourceFile" = AttributeInfoSourceFile <$> (getUtf8Info pool =<< getU2)
-    matchAttribute "SourceDebugExtension" = undefined
-    matchAttribute "LineNumberTable" = AttributeInfoLineNumberTable <$> (readLineNumberTable =<< getU2)
-      where
-        readLineNumberTable :: Word16 -> ReadResult [(Word16, Word16)]
-        readLineNumberTable n = replicateM (fromIntegral n) readLineNumber
-        readLineNumber :: ReadResult (Word16, Word16)
-        readLineNumber = (,) <$> getU2 <*> getU2
-    matchAttribute "LocalVariableTable" = AttributeInfoLocalVariableTable <$> (readLocalVariableTable =<< getU2)
-      where
-        readLocalVariableTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16, Word16)]
-        readLocalVariableTable n = replicateM (fromIntegral n) readLocalVariable
-        readLocalVariable :: ReadResult (Word16, Word16, Word16, Word16, Word16)
-        readLocalVariable = (,,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2 <*> getU2
-    matchAttribute "LocalVariableTypeTable" = AttributeInfoLocalVariableTypeTable <$> (readLocalVariableTypeTable =<< getU2)
-      where
-        readLocalVariableTypeTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16, Word16)]
-        readLocalVariableTypeTable n = replicateM (fromIntegral n) readLocalVariableType
-        readLocalVariableType :: ReadResult (Word16, Word16, Word16, Word16, Word16)
-        readLocalVariableType = (,,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2 <*> getU2
-    matchAttribute "Deprecated" = pure AttributeInfoDeprecated
-    matchAttribute "RuntimeVisibleAnnotations" = undefined
-    matchAttribute "RuntimeInvisibleAnnotations" = undefined
-    matchAttribute "RuntimeVisibleParameterAnnotations" = undefined
-    matchAttribute "RuntimeInvisibleParameterAnnotations" = undefined
-    matchAttribute "AnnotationDefault" = undefined
-    matchAttribute "BootstrapMethods" = undefined
-    -- TODO: returning UnsupportedAttribute here gives a weird behavior with BG.isolate lol
-    matchAttribute name = error name
+    matchAttribute = \case
+      "ConstantValue" -> AttributeInfoConstantValue <$> getU2
+      "Code" -> uncurry5 AttributeInfoCode <$> readCode
+        where
+          readCode :: ReadResult (Word16, Word16, [Word8], [(Word16, Word16, Word16, Word16)], [AttributeInfo])
+          readCode = do
+            maxStack <- getU2
+            maxLocals <- getU2
+            codeLen <- fromIntegral <$> getU4
+            code <- unpack <$> (lift . BG.getByteString $ codeLen)
+            exnTable <- readExceptionTable =<< getU2
+            attributes <- readAttributes pool =<< getU2
+            pure (maxStack, maxLocals, code, exnTable, attributes)
+          readExceptionTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16)]
+          readExceptionTable n = replicateM (fromIntegral n) readException
+          readException :: ReadResult (Word16, Word16, Word16, Word16)
+          readException = (,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2
+          uncurry5 f (a, b, c, d, e) = f a b c d e
+      "StackMapTable" -> undefined
+      "Exceptions" -> AttributeInfoExceptions <$> (readExceptions =<< getU2)
+        where
+          readExceptions :: Word16 -> ReadResult [Word16]
+          readExceptions n = replicateM (fromIntegral n) getU2
+      "InnerClasses" -> undefined
+      "EnclosingMethod" -> undefined
+      "Synthetic" -> undefined
+      "Signature" -> undefined
+      "SourceFile" -> AttributeInfoSourceFile <$> (getUtf8Info pool =<< getU2)
+      "SourceDebugExtension" -> undefined
+      "LineNumberTable" -> AttributeInfoLineNumberTable <$> (readLineNumberTable =<< getU2)
+        where
+          readLineNumberTable :: Word16 -> ReadResult [(Word16, Word16)]
+          readLineNumberTable n = replicateM (fromIntegral n) readLineNumber
+          readLineNumber :: ReadResult (Word16, Word16)
+          readLineNumber = (,) <$> getU2 <*> getU2
+      "LocalVariableTable" -> AttributeInfoLocalVariableTable <$> (readLocalVariableTable =<< getU2)
+        where
+          readLocalVariableTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16, Word16)]
+          readLocalVariableTable n = replicateM (fromIntegral n) readLocalVariable
+          readLocalVariable :: ReadResult (Word16, Word16, Word16, Word16, Word16)
+          readLocalVariable = (,,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2 <*> getU2
+      "LocalVariableTypeTable" -> AttributeInfoLocalVariableTypeTable <$> (readLocalVariableTypeTable =<< getU2)
+        where
+          readLocalVariableTypeTable :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16, Word16)]
+          readLocalVariableTypeTable n = replicateM (fromIntegral n) readLocalVariableType
+          readLocalVariableType :: ReadResult (Word16, Word16, Word16, Word16, Word16)
+          readLocalVariableType = (,,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2 <*> getU2
+      "Deprecated" -> pure AttributeInfoDeprecated
+      "RuntimeVisibleAnnotations" -> undefined
+      "RuntimeInvisibleAnnotations" -> undefined
+      "RuntimeVisibleParameterAnnotations" -> undefined
+      "RuntimeInvisibleParameterAnnotations" -> undefined
+      "AnnotationDefault" -> undefined
+      "BootstrapMethods" -> undefined
+      -- TODO: returning UnsupportedAttribute here gives a weird behavior with BG.isolate lol
+      name -> error name
