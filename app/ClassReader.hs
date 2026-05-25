@@ -66,12 +66,38 @@ data MethodInfo = MethodInfo
 data AttributeInfo
   = AttributeInfoConstantValue Word16
   | AttributeInfoCode Word16 Word16 [Word8] [(Word16, Word16, Word16, Word16)] [AttributeInfo]
+  | AttributeInfoStackMapTable [StackMapFrame]
   | AttributeInfoExceptions [Word16]
+  | AttributeInfoInnerClasses [(Word16, Word16, Word16, Word16)]
+  | AttributeInfoEnclosingMethod Word16 Word16
+  | AttributeInfoSynthetic
+  | AttributeInfoSignature Word16
   | AttributeInfoLineNumberTable [(Word16, Word16)]
   | AttributeInfoSourceFile String
+  | AttributeInfoSourceDebugExtension [Word8]
   | AttributeInfoLocalVariableTable [(Word16, Word16, Word16, Word16, Word16)]
   | AttributeInfoLocalVariableTypeTable [(Word16, Word16, Word16, Word16, Word16)]
   | AttributeInfoDeprecated
+  deriving (Show)
+
+data StackMapFrame
+  = SameFrame Word8
+  | SameLocals1StackItemFrame Word8 VerificationTypeInfo
+  | SameLocals1StackItemFrameExtended Word16 VerificationTypeInfo
+  | ChopFrame Word16 Word8
+  | SameFrameExtended Word16
+  deriving (Show)
+
+data VerificationTypeInfo
+  = TopVariable
+  | IntegerVariable
+  | FloatVariable
+  | DoubleVariable
+  | LongVariable
+  | NullVariable
+  | UninitializedThisVariable
+  | ObjectVariable Word16
+  | UninitializedVariable Word16
   deriving (Show)
 
 data ClassReadError
@@ -79,6 +105,7 @@ data ClassReadError
   | InvalidPoolEntryTag Word8
   | InvalidUtf8PoolIndex Word16
   | InvalidClassInfoPoolIdx Word16
+  | InvalidVerificationTypeTag Word8
   | UnsupportedAttribute String
   deriving (Show)
 
@@ -218,17 +245,45 @@ readAttributeInfo pool = do
           readException :: ReadResult (Word16, Word16, Word16, Word16)
           readException = (,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2
           uncurry5 f (a, b, c, d, e) = f a b c d e
-      "StackMapTable" -> undefined
+      "StackMapTable" -> AttributeInfoStackMapTable <$> (readStackMapFrames =<< getU2)
+        where
+          readStackMapFrames :: Word16 -> ReadResult [StackMapFrame]
+          readStackMapFrames n = replicateM (fromIntegral n) (readStackMapFrame =<< getU1)
+          readStackMapFrame :: Word8 -> ReadResult StackMapFrame
+          readStackMapFrame frameType
+            | frameType <= 63 = pure $ SameFrame frameType
+            | frameType <= 127 = SameLocals1StackItemFrame frameType <$> (readVerificationTypeInfo =<< getU1)
+            | frameType == 247 = SameLocals1StackItemFrameExtended <$> getU2 <*> (readVerificationTypeInfo =<< getU1)
+            | frameType <= 250 = ChopFrame <$> getU2 <*> pure (251 - frameType)
+            | frameType == 251 = SameFrameExtended <$> getU2
+            | otherwise = error "TODO"
+          readVerificationTypeInfo :: Word8 -> ReadResult VerificationTypeInfo
+          readVerificationTypeInfo = \case
+            0 -> pure TopVariable
+            1 -> pure IntegerVariable
+            2 -> pure FloatVariable
+            3 -> pure DoubleVariable
+            4 -> pure LongVariable
+            5 -> pure NullVariable
+            6 -> pure UninitializedThisVariable
+            7 -> ObjectVariable <$> getU2
+            8 -> UninitializedVariable <$> getU2
+            tag -> throwError $ InvalidVerificationTypeTag tag
       "Exceptions" -> AttributeInfoExceptions <$> (readExceptions =<< getU2)
         where
           readExceptions :: Word16 -> ReadResult [Word16]
           readExceptions n = replicateM (fromIntegral n) getU2
-      "InnerClasses" -> undefined
-      "EnclosingMethod" -> undefined
-      "Synthetic" -> undefined
-      "Signature" -> undefined
+      "InnerClasses" -> AttributeInfoInnerClasses <$> (readInnerClasses =<< getU2)
+        where
+          readInnerClasses :: Word16 -> ReadResult [(Word16, Word16, Word16, Word16)]
+          readInnerClasses n = replicateM (fromIntegral n) readInnerClass
+          readInnerClass :: ReadResult (Word16, Word16, Word16, Word16)
+          readInnerClass = (,,,) <$> getU2 <*> getU2 <*> getU2 <*> getU2
+      "EnclosingMethod" -> AttributeInfoEnclosingMethod <$> getU2 <*> getU2
+      "Synthetic" -> pure AttributeInfoSynthetic
+      "Signature" -> AttributeInfoSignature <$> getU2
       "SourceFile" -> AttributeInfoSourceFile <$> (getUtf8Info pool =<< getU2)
-      "SourceDebugExtension" -> undefined
+      "SourceDebugExtension" -> AttributeInfoSourceDebugExtension <$> BS.unpack <$> lift BG.getRemainingLazyByteString
       "LineNumberTable" -> AttributeInfoLineNumberTable <$> (readLineNumberTable =<< getU2)
         where
           readLineNumberTable :: Word16 -> ReadResult [(Word16, Word16)]
